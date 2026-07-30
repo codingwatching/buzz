@@ -63,7 +63,8 @@ import {
   type SettingsSection,
   isSettingsSection,
 } from "@/features/settings/ui/SettingsPanels";
-import { HuddleBar, HuddleProvider } from "@/features/huddle";
+import { HuddleProvider } from "@/features/huddle";
+import { AppHuddleBar } from "@/app/AppHuddleBar";
 import { useDueReminderBadgeCount } from "@/features/reminders/hooks";
 import { RemindMeLaterProvider } from "@/features/reminders/ui/RemindMeLaterProvider";
 import { useReminderNotifications } from "@/features/reminders/useReminderNotifications";
@@ -96,7 +97,7 @@ import { useMessageDeepLinks } from "@/shared/useMessageDeepLinks";
 import { SidebarInset, SidebarProvider } from "@/shared/ui/sidebar";
 import { RelayConnectionOverlay } from "@/app/RelayConnectionOverlay";
 import { useSidebarRelayConnectionCard } from "@/features/sidebar/ui/useSidebarRelayConnectionCard";
-
+import { AppProfilePanelProvider } from "@/app/AppProfilePanelProvider";
 const LazySettingsScreen = React.lazy(async () => {
   const module = await import("@/features/settings/ui/SettingsScreen");
   return { default: module.SettingsScreen };
@@ -620,14 +621,8 @@ export function AppShell() {
     unreadChannelIds,
     unreadChannelNotificationCount,
   });
-
   // Dispatch `buzz://message` deep links into the router.
   useMessageDeepLinks();
-
-  const handleOpenNewDm = React.useCallback(
-    () => void goNewMessage(),
-    [goNewMessage],
-  );
   const handleOpenCreateChannel = React.useCallback(
     () => setIsCreateChannelOpen(true),
     [],
@@ -660,7 +655,7 @@ export function AppShell() {
 
       if (key === "k" && event.shiftKey) {
         event.preventDefault();
-        handleOpenNewDm();
+        void goNewMessage();
         return;
       }
 
@@ -689,9 +684,9 @@ export function AppShell() {
     };
   }, [
     handleOpenBrowseChannels,
-    handleOpenNewDm,
     handleOpenCreateChannel,
     handleOpenSearch,
+    goNewMessage,
     goHome,
     settingsOpen,
   ]);
@@ -781,43 +776,47 @@ export function AppShell() {
                     {settingsOpen ? (
                       <div className="flex min-h-0 flex-1 overflow-hidden">
                         <React.Suspense fallback={null}>
-                          <LazySettingsScreen
-                            currentPubkey={identityQuery.data?.pubkey}
-                            fallbackDisplayName={
-                              identityQuery.data?.displayName
-                            }
-                            isUpdatingDesktopNotifications={
-                              notificationSettings.isUpdatingDesktopEnabled
-                            }
-                            notificationErrorMessage={
-                              notificationSettings.errorMessage
-                            }
-                            notificationPermission={
-                              notificationSettings.permission
-                            }
-                            notificationSettings={notificationSettings.settings}
-                            onClose={handleCloseSettings}
-                            onSectionChange={handleSettingsSectionChange}
-                            onSetDesktopNotificationsEnabled={
-                              notificationSettings.setDesktopEnabled
-                            }
-                            onSetHomeBadgeEnabled={
-                              notificationSettings.setHomeBadgeEnabled
-                            }
-                            onSetSlotAlertsEnabled={
-                              notificationSettings.setSlotAlertsEnabled
-                            }
-                            onSetNotifyWhileViewing={
-                              notificationSettings.setNotifyWhileViewing
-                            }
-                            onSetAllSlotAlertsEnabled={
-                              notificationSettings.setAllSlotAlertsEnabled
-                            }
-                            onSetSoundForSlot={
-                              notificationSettings.setSoundForSlot
-                            }
-                            section={settingsSection}
-                          />
+                          <AppProfilePanelProvider>
+                            <LazySettingsScreen
+                              currentPubkey={identityQuery.data?.pubkey}
+                              fallbackDisplayName={
+                                identityQuery.data?.displayName
+                              }
+                              isUpdatingDesktopNotifications={
+                                notificationSettings.isUpdatingDesktopEnabled
+                              }
+                              notificationErrorMessage={
+                                notificationSettings.errorMessage
+                              }
+                              notificationPermission={
+                                notificationSettings.permission
+                              }
+                              notificationSettings={
+                                notificationSettings.settings
+                              }
+                              onClose={handleCloseSettings}
+                              onSectionChange={handleSettingsSectionChange}
+                              onSetDesktopNotificationsEnabled={
+                                notificationSettings.setDesktopEnabled
+                              }
+                              onSetHomeBadgeEnabled={
+                                notificationSettings.setHomeBadgeEnabled
+                              }
+                              onSetSlotAlertsEnabled={
+                                notificationSettings.setSlotAlertsEnabled
+                              }
+                              onSetNotifyWhileViewing={
+                                notificationSettings.setNotifyWhileViewing
+                              }
+                              onSetAllSlotAlertsEnabled={
+                                notificationSettings.setAllSlotAlertsEnabled
+                              }
+                              onSetSoundForSlot={
+                                notificationSettings.setSoundForSlot
+                              }
+                              section={settingsSection}
+                            />
+                          </AppProfilePanelProvider>
                         </React.Suspense>
                       </div>
                     ) : (
@@ -848,7 +847,7 @@ export function AppShell() {
                           onAddCommunityOpenChange={
                             addCommunityDialog.onOpenChange
                           }
-                          onNewMessage={handleOpenNewDm}
+                          onNewMessage={goNewMessage}
                           onBackgroundClick={requestFocusedThreadClose}
                           onCreateChannelOpenChange={setIsCreateChannelOpen}
                           onOpenAddCommunity={addCommunityDialog.openDialog}
@@ -977,8 +976,7 @@ export function AppShell() {
                 </div>
 
                 <div className="absolute inset-x-0 bottom-0 z-0 h-(--buzz-huddle-drawer-height)">
-                  <HuddleBar
-                    className="h-full"
+                  <AppHuddleBar
                     onOpenThread={(channelId, messageId) => {
                       void goChannel(channelId, {
                         messageId,
