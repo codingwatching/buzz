@@ -115,9 +115,11 @@ test("a consuming client can switch to sharing its saved local model", async ({
     page.getByTestId("mesh-share-compute-options-motion"),
   ).toHaveCount(0);
   await expect(toggle).toBeEnabled();
-  await expect(page.getByLabel("Custom model reference")).toHaveValue(
-    localModel,
-  );
+  const customModel = page.getByLabel("Custom model reference");
+  await expect(customModel).toHaveValue(localModel);
+  await customModel.fill("");
+  await expect(customModel).toBeVisible();
+  await customModel.fill("hf://demo/replacement-model:Q4_K_M");
   await toggle.click();
   await expect(toggle).toBeChecked();
 
@@ -128,6 +130,8 @@ test("a consuming client can switch to sharing its saved local model", async ({
   expect(commands.names).not.toContain("mesh_stop_node");
   expect(commands.payloads).toContainEqual({
     command: "mesh_start_node",
-    payload: { request: { mode: "serve", modelId: localModel } },
+    payload: {
+      request: { mode: "serve", modelId: "hf://demo/replacement-model:Q4_K_M" },
+    },
   });
 });

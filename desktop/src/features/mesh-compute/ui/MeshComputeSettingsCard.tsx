@@ -567,7 +567,13 @@ function MeshModelPicker({
           aria-label="Custom model reference"
           autoCorrect="off"
           disabled={disabled}
-          onChange={(event) => onModelChange(event.target.value)}
+          onChange={(event) => {
+            // A stored custom ref starts out inferred rather than explicitly
+            // selected. Mark it as an active custom edit before applying a
+            // cleared value so the field stays mounted while it is replaced.
+            onCustomModelEditingChange(true);
+            onModelChange(event.target.value);
+          }}
           placeholder="Qwen3-8B-Q4_K_M or hf://meshllm/qwen3-8b@main"
           usePersonaInputStyle
           value={model}
