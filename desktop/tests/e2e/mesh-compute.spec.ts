@@ -115,11 +115,11 @@ test("a consuming client can switch to sharing its saved local model", async ({
     page.getByTestId("mesh-share-compute-options-motion"),
   ).toHaveCount(0);
   await expect(toggle).toBeEnabled();
-  await toggle.click();
-  await expect(toggle).toBeChecked();
   await expect(page.getByLabel("Custom model reference")).toHaveValue(
     localModel,
   );
+  await toggle.click();
+  await expect(toggle).toBeChecked();
 
   const commands = await page.evaluate(() => ({
     names: (window as E2eWindow).__BUZZ_E2E_COMMANDS__ ?? [],
