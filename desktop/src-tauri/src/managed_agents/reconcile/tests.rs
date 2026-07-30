@@ -255,6 +255,7 @@ fn slimming_republish_wave_is_one_time() {
                 content: fat_content,
                 created_at: 1,
                 raw_event: String::new(),
+                event_id: None,
                 pending_sync: false,
             },
         )

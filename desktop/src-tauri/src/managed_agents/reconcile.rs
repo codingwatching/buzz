@@ -27,7 +27,6 @@ use super::{
     ManagedAgentRecord,
 };
 use buzz_core_pkg::kind::KIND_MANAGED_AGENT;
-use nostr::JsonUtil;
 
 /// Reconcile `managed-agents.json` into kind:30177 events in the retention
 /// store. Boot-time entry point, called from `event_sync::run_event_sync`
@@ -151,15 +150,12 @@ pub(crate) fn retain_agent_record(
 
     retain_event(
         conn,
-        &RetainedEvent {
-            kind: KIND_MANAGED_AGENT,
-            pubkey: owner_pubkey,
-            d_tag: record.pubkey.clone(),
-            content,
-            created_at: event.created_at.as_secs() as i64,
-            raw_event: event.as_json(),
-            pending_sync: true,
-        },
+        &RetainedEvent::pending(
+            KIND_MANAGED_AGENT,
+            owner_pubkey,
+            record.pubkey.clone(),
+            &event,
+        ),
     )
     .map_err(|e| format!("failed to retain '{}': {e}", record.name))?;
     Ok(true)

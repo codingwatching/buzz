@@ -644,7 +644,6 @@ fn retain_agent_pending(app: &AppHandle, state: &AppState, record: &ManagedAgent
         retention::{get_retained_event, open_retention_db, retain_event, RetainedEvent},
     };
     use buzz_core_pkg::kind::KIND_MANAGED_AGENT;
-    use nostr::JsonUtil;
 
     let result = (|| -> Result<(), String> {
         let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
@@ -667,15 +666,12 @@ fn retain_agent_pending(app: &AppHandle, state: &AppState, record: &ManagedAgent
         };
         retain_event(
             &conn,
-            &RetainedEvent {
-                kind: KIND_MANAGED_AGENT,
-                pubkey: owner_pubkey,
-                d_tag: record.pubkey.clone(),
-                content: event.content.to_string(),
-                created_at: event.created_at.as_secs() as i64,
-                raw_event: event.as_json(),
-                pending_sync: true,
-            },
+            &RetainedEvent::pending(
+                KIND_MANAGED_AGENT,
+                owner_pubkey,
+                record.pubkey.clone(),
+                &event,
+            ),
         )
     })();
     if let Err(e) = result {

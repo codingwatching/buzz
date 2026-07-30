@@ -156,7 +156,6 @@ pub(super) fn prepare_persona_publication_at(
         retention::{get_retained_event, open_retention_db, retain_event, RetainedEvent},
     };
     use buzz_core_pkg::kind::KIND_PERSONA;
-    use nostr::JsonUtil;
 
     let d_tag = persona_d_tag(persona);
     let pubkey = keys.public_key().to_hex();
@@ -171,15 +170,7 @@ pub(super) fn prepare_persona_publication_at(
         ))
         .sign_with_keys(keys)
         .map_err(|e| format!("failed to sign persona event: {e}"))?;
-    let retained = RetainedEvent {
-        kind: KIND_PERSONA,
-        pubkey,
-        d_tag,
-        content: event.content.to_string(),
-        created_at: event.created_at.as_secs() as i64,
-        raw_event: event.as_json(),
-        pending_sync: true,
-    };
+    let retained = RetainedEvent::pending(KIND_PERSONA, pubkey, d_tag, &event);
     retain_event(&conn, &retained)?;
     Ok((event, retained, scoped_persona))
 }
@@ -209,7 +200,6 @@ pub(in crate::commands) fn tombstone_persona_pending(
         },
     };
     use buzz_core_pkg::kind::KIND_PERSONA;
-    use nostr::JsonUtil;
 
     const KIND_DELETE: u32 = 5;
 
@@ -225,17 +215,14 @@ pub(in crate::commands) fn tombstone_persona_pending(
         delete_retained_event(&conn, KIND_PERSONA, &pubkey, d_tag)?;
         retain_event(
             &conn,
-            &RetainedEvent {
-                kind: KIND_DELETE,
+            &RetainedEvent::pending(
+                KIND_DELETE,
                 pubkey,
                 // Key by the target coordinate so cross-kind d-tag tombstones
                 // occupy distinct rows (F2c).
-                d_tag: tombstone_retention_d_tag(KIND_PERSONA, d_tag),
-                content: event.content.to_string(),
-                created_at: event.created_at.as_secs() as i64,
-                raw_event: event.as_json(),
-                pending_sync: true,
-            },
+                tombstone_retention_d_tag(KIND_PERSONA, d_tag),
+                &event,
+            ),
         )
     })();
     if let Err(e) = result {

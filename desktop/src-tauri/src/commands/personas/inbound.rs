@@ -78,7 +78,6 @@ fn reconcile_inbound_persona_event_blocking(
         team_events::team_content_from_event,
     };
     use buzz_core_pkg::kind::{KIND_DELETION, KIND_MANAGED_AGENT, KIND_PERSONA, KIND_TEAM};
-    use nostr::JsonUtil;
 
     let state = app.state::<AppState>();
     let event = parse_verified_inbound_event(&event_json)?;
@@ -133,15 +132,7 @@ fn reconcile_inbound_persona_event_blocking(
     let conn = open_retention_db(&scope.db_path)?;
     let outcome = retain_inbound_event(
         &conn,
-        &RetainedEvent {
-            kind,
-            pubkey: event.pubkey.to_hex(),
-            d_tag: d_tag.clone(),
-            content: event.content.to_string(),
-            created_at: event.created_at.as_secs() as i64,
-            raw_event: event.as_json(),
-            pending_sync: false,
-        },
+        &RetainedEvent::inbound(kind, event.pubkey.to_hex(), d_tag.clone(), &event),
     )?;
     if outcome == InboundOutcome::Skipped {
         return Ok(());
@@ -245,7 +236,6 @@ fn reconcile_inbound_tombstone(
         save_managed_agents, save_teams,
     };
     use buzz_core_pkg::kind::{KIND_DELETION, KIND_MANAGED_AGENT, KIND_PERSONA, KIND_TEAM};
-    use nostr::JsonUtil;
 
     let Some((target_kind, target_d_tag)) = parse_deletion_coordinate(event) else {
         return Ok(()); // no routable coordinate — nothing to delete
@@ -272,15 +262,12 @@ fn reconcile_inbound_tombstone(
     let conn = open_retention_db(&scope.db_path)?;
     let outcome = retain_inbound_event(
         &conn,
-        &RetainedEvent {
-            kind: KIND_DELETION,
-            pubkey: event.pubkey.to_hex(),
-            d_tag: tombstone_retention_d_tag(target_kind, &target_d_tag),
-            content: event.content.to_string(),
-            created_at: event.created_at.as_secs() as i64,
-            raw_event: event.as_json(),
-            pending_sync: false,
-        },
+        &RetainedEvent::inbound(
+            KIND_DELETION,
+            event.pubkey.to_hex(),
+            tombstone_retention_d_tag(target_kind, &target_d_tag),
+            event,
+        ),
     )?;
     if outcome == InboundOutcome::Skipped {
         return Ok(());

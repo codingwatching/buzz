@@ -83,7 +83,6 @@ pub(super) fn tombstone_managed_agent_pending(
         },
     };
     use buzz_core_pkg::kind::KIND_MANAGED_AGENT;
-    use nostr::JsonUtil;
 
     const KIND_DELETE: u32 = 5;
 
@@ -97,17 +96,12 @@ pub(super) fn tombstone_managed_agent_pending(
         delete_retained_event(&conn, KIND_MANAGED_AGENT, &owner_pubkey, agent_pubkey)?;
         retain_event(
             &conn,
-            &RetainedEvent {
-                kind: KIND_DELETE,
-                pubkey: owner_pubkey,
-                // Key by the target coordinate so cross-kind d-tag tombstones
-                // occupy distinct rows (F2c).
-                d_tag: tombstone_retention_d_tag(KIND_MANAGED_AGENT, agent_pubkey),
-                content: event.content.to_string(),
-                created_at: event.created_at.as_secs() as i64,
-                raw_event: event.as_json(),
-                pending_sync: true,
-            },
+            &RetainedEvent::pending(
+                KIND_DELETE,
+                owner_pubkey,
+                tombstone_retention_d_tag(KIND_MANAGED_AGENT, agent_pubkey),
+                &event,
+            ),
         )
     })();
     if let Err(e) = result {
@@ -176,7 +170,6 @@ pub(super) fn build_agent_archive_request(
 pub(super) fn archive_managed_agent_pending(app: &AppHandle, state: &AppState, agent_pubkey: &str) {
     use crate::managed_agents::retention::{open_retention_db, retain_event, RetainedEvent};
     use buzz_core_pkg::kind::KIND_IA_ARCHIVE_REQUEST;
-    use nostr::JsonUtil;
 
     let result = (|| -> Result<(), String> {
         let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
@@ -185,15 +178,12 @@ pub(super) fn archive_managed_agent_pending(app: &AppHandle, state: &AppState, a
         let conn = open_retention_db(&scope.db_path)?;
         retain_event(
             &conn,
-            &RetainedEvent {
-                kind: KIND_IA_ARCHIVE_REQUEST,
-                pubkey: owner_pubkey,
-                d_tag: agent_pubkey.to_string(),
-                content: event.content.to_string(),
-                created_at: event.created_at.as_secs() as i64,
-                raw_event: event.as_json(),
-                pending_sync: true,
-            },
+            &RetainedEvent::pending(
+                KIND_IA_ARCHIVE_REQUEST,
+                owner_pubkey,
+                agent_pubkey.to_string(),
+                &event,
+            ),
         )
     })();
     if let Err(e) = result {

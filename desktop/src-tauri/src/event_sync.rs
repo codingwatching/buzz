@@ -186,17 +186,7 @@ fn migrate_personas_in_dir_at(
             continue;
         }
 
-        let retained = RetainedEvent {
-            kind: KIND_PERSONA,
-            pubkey: pubkey.clone(),
-            d_tag,
-            content: event_content,
-            // Safety: nostr timestamps are seconds and stay below i64::MAX
-            // until year 2262.
-            created_at: event.created_at.as_secs() as i64,
-            raw_event: event.as_json(),
-            pending_sync: true,
-        };
+        let retained = RetainedEvent::pending(KIND_PERSONA, pubkey.clone(), d_tag, &event);
 
         // The monotonic bump guarantees `created_at > head`, so the upsert's
         // `>=` guard always lands the UPDATE — `migrated` counts only real,
@@ -259,7 +249,6 @@ fn migrate_teams_in_dir_at(
         TeamRecord,
     };
     use buzz_core_pkg::kind::KIND_TEAM;
-    use nostr::JsonUtil;
 
     let pubkey = keys.public_key().to_hex();
 
@@ -312,15 +301,7 @@ fn migrate_teams_in_dir_at(
             continue;
         }
 
-        let retained = RetainedEvent {
-            kind: KIND_TEAM,
-            pubkey: pubkey.clone(),
-            d_tag,
-            content: event_content,
-            created_at: event.created_at.as_secs() as i64,
-            raw_event: event.as_json(),
-            pending_sync: true,
-        };
+        let retained = RetainedEvent::pending(KIND_TEAM, pubkey.clone(), d_tag, &event);
 
         // Monotonic bump guarantees the upsert UPDATE lands — `migrated` counts
         // only real republishes.

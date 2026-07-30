@@ -16,6 +16,7 @@ fn pending_tombstone(d_tag: &str) -> RetainedEvent {
         content: String::new(),
         created_at: 1_700_000_000,
         raw_event: format!(r#"{{"kind":5,"d":"{d_tag}"}}"#),
+        event_id: None,
         pending_sync: true,
     }
 }
@@ -141,6 +142,7 @@ fn test_post_upgrade_scoped_row_is_not_overwritten_by_its_legacy_ancestor() {
         content: r#"{"display_name":"Old"}"#.to_string(),
         created_at: 1_700_000_000,
         raw_event: r#"{"content":"old"}"#.to_string(),
+        event_id: None,
         pending_sync: true,
     };
     seed_legacy(dir.path(), &[legacy_head]);
@@ -157,6 +159,7 @@ fn test_post_upgrade_scoped_row_is_not_overwritten_by_its_legacy_ancestor() {
             content: r#"{"display_name":"New"}"#.to_string(),
             created_at: 1_700_000_500,
             raw_event: r#"{"content":"new"}"#.to_string(),
+            event_id: None,
             pending_sync: true,
         },
     )

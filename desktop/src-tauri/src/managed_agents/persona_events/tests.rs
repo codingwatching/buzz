@@ -828,6 +828,7 @@ mod flush_barrier {
                 content: event.content.to_string(),
                 created_at,
                 raw_event: event.as_json(),
+                event_id: None,
                 pending_sync: true,
             },
         )

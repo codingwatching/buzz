@@ -113,6 +113,11 @@ pub fn migrate_legacy_retention_db(
 /// Owner-filtered because the flush loop only publishes rows matching the
 /// active owner anyway; a different identity's rows belong to that identity's
 /// scope, not this one.
+///
+/// The legacy table predates `event_id`, so the ordering key is re-derived from
+/// each row's stored event rather than read from a column. A row whose bytes do
+/// not verify carries `None` and is treated as unresolved by the comparator —
+/// same rule the in-place schema backfill applies.
 fn legacy_rows_for_owner(
     conn: &Connection,
     owner_pubkey: &str,
@@ -128,13 +133,15 @@ fn legacy_rows_for_owner(
 
     let rows = stmt
         .query_map(params![owner_pubkey], |row| {
+            let raw_event: String = row.get(5)?;
             Ok(RetainedEvent {
                 kind: row.get(0)?,
                 pubkey: row.get(1)?,
                 d_tag: row.get(2)?,
                 content: row.get(3)?,
                 created_at: row.get(4)?,
-                raw_event: row.get(5)?,
+                event_id: super::event_id_from_raw(&raw_event),
+                raw_event,
                 pending_sync: row.get::<_, i32>(6)? != 0,
             })
         })

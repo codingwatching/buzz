@@ -15,6 +15,7 @@ use tauri::AppHandle;
 use crate::app_state::AppState;
 
 mod legacy_migration;
+mod schema;
 pub use legacy_migration::migrate_legacy_retention_db;
 
 /// Durable event-retention scope for one community relay and owner identity.
@@ -116,6 +117,67 @@ pub struct RetainedEvent {
     pub created_at: i64,
     pub raw_event: String,
     pub pending_sync: bool,
+    /// NIP-01 id of this row's own event, the second half of the ordering key.
+    ///
+    /// NIP-33 resolves an equal-`created_at` collision by lowest event id, so a
+    /// row without an id cannot be ordered against a relay head at all. `None`
+    /// means exactly that — unresolved: a legacy row whose `raw_event` did not
+    /// parse and verify during the schema backfill. Writers derive the value
+    /// from the event they just signed, so it always describes `raw_event`.
+    pub event_id: Option<String>,
+}
+
+/// Re-derive an event's NIP-01 id from its stored JSON, or `None` when the
+/// bytes do not parse or do not verify.
+///
+/// Deliberately not `serde_json::from_str::<Value>()["id"]`: the id is only an
+/// ordering key worth trusting if the stored bytes actually hash and sign to
+/// it. A row that fails here stays unresolved rather than being handed a
+/// self-asserted key it could win a comparator tie with.
+pub fn event_id_from_raw(raw_event: &str) -> Option<String> {
+    use nostr::JsonUtil;
+    let event = nostr::Event::from_json(raw_event).ok()?;
+    event.verify().ok()?;
+    Some(event.id.to_hex())
+}
+
+impl RetainedEvent {
+    /// A row for a locally signed event that still has to reach the relay.
+    ///
+    /// Every event-derived field is read from the one event passed in, so a row
+    /// can never carry an `event_id` that describes different bytes than its own
+    /// `raw_event` — the ordering key and the payload cannot drift apart.
+    pub fn pending(kind: u32, pubkey: String, d_tag: String, event: &nostr::Event) -> Self {
+        Self::from_signed(kind, pubkey, d_tag, event, true)
+    }
+
+    /// A row for an event that arrived FROM the relay, and so is already
+    /// published.
+    pub fn inbound(kind: u32, pubkey: String, d_tag: String, event: &nostr::Event) -> Self {
+        Self::from_signed(kind, pubkey, d_tag, event, false)
+    }
+
+    fn from_signed(
+        kind: u32,
+        pubkey: String,
+        d_tag: String,
+        event: &nostr::Event,
+        pending_sync: bool,
+    ) -> Self {
+        use nostr::JsonUtil;
+        Self {
+            kind,
+            pubkey,
+            d_tag,
+            content: event.content.to_string(),
+            // Safety: nostr timestamps are seconds and stay below i64::MAX
+            // until year 2262.
+            created_at: event.created_at.as_secs() as i64,
+            raw_event: event.as_json(),
+            event_id: Some(event.id.to_hex()),
+            pending_sync,
+        }
+    }
 }
 
 /// Open (or create) the retention database at the given path.
@@ -124,7 +186,8 @@ pub struct RetainedEvent {
 /// flush-loop connection and command-path connections can write concurrently
 /// without spurious `SQLITE_BUSY` errors.
 pub fn open_retention_db(path: &Path) -> Result<Connection, String> {
-    let conn = Connection::open(path).map_err(|e| format!("failed to open retention db: {e}"))?;
+    let mut conn =
+        Connection::open(path).map_err(|e| format!("failed to open retention db: {e}"))?;
 
     conn.pragma_update(None, "busy_timeout", 5000)
         .map_err(|e| format!("failed to set busy_timeout: {e}"))?;
@@ -139,10 +202,14 @@ pub fn open_retention_db(path: &Path) -> Result<Connection, String> {
             created_at INTEGER NOT NULL,
             raw_event TEXT NOT NULL,
             pending_sync INTEGER NOT NULL DEFAULT 0,
+            event_id TEXT,
+            baseline_event_id TEXT,
+            baseline_content TEXT,
             PRIMARY KEY (kind, pubkey, d_tag)
         );",
     )
     .map_err(|e| format!("failed to create retention table: {e}"))?;
+    schema::migrate(&mut conn)?;
 
     Ok(conn)
 }
@@ -209,13 +276,14 @@ pub fn deferred_behind_failed_tombstone(
 /// Only replaces if the new event has a newer or equal `created_at` (NIP-33 semantics).
 pub fn retain_event(conn: &Connection, event: &RetainedEvent) -> Result<(), String> {
     conn.execute(
-        "INSERT INTO persona_events (kind, pubkey, d_tag, content, created_at, raw_event, pending_sync)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "INSERT INTO persona_events (kind, pubkey, d_tag, content, created_at, raw_event, pending_sync, event_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
          ON CONFLICT (kind, pubkey, d_tag) DO UPDATE SET
             content = excluded.content,
             created_at = excluded.created_at,
             raw_event = excluded.raw_event,
-            pending_sync = excluded.pending_sync
+            pending_sync = excluded.pending_sync,
+            event_id = excluded.event_id
          WHERE excluded.created_at >= persona_events.created_at",
         params![
             event.kind,
@@ -225,6 +293,7 @@ pub fn retain_event(conn: &Connection, event: &RetainedEvent) -> Result<(), Stri
             event.created_at,
             event.raw_event,
             event.pending_sync as i32,
+            event.event_id,
         ],
     )
     .map_err(|e| format!("failed to retain event: {e}"))?;
@@ -255,12 +324,20 @@ pub enum InboundOutcome {
 /// - No local row, or inbound strictly newer (`created_at >`): apply the
 ///   inbound event, clearing `pending_sync`. Inbound wins; a stale local edit
 ///   the relay already superseded stops republishing instead of looping.
-/// - Equal `created_at`: skip. Nostr time is seconds-granularity, so a pending
-///   local edit and an inbound event can share a timestamp; applying here would
-///   clear `pending_sync` and drop the local publish. Skipping leaves the
-///   pending row intact so the flush republishes and the relay resolves
-///   last-writer-wins. (A re-received echo at equal time is also a no-op.)
+/// - Equal `created_at`, local row NOT pending: order by event id, matching the
+///   relay's own NIP-33 comparator — lowest id wins (`buzz-db`'s
+///   `replace_parameterized_event` rejects an incoming event whose id is `>=`
+///   the accepted one at an equal timestamp). Without this the local cache can
+///   disagree with the relay about which of two same-second events is the head,
+///   and every subsequent compare against that head inherits the error.
+/// - Equal `created_at`, local row pending: skip regardless of id. A pending row
+///   is durable local intent, and intent is arbitrated by the boot decision
+///   pass against a writer-consistent head — never dropped by an id compare
+///   here. (A re-received echo at equal time is also a no-op.)
 /// - Inbound older: skip — nothing to change.
+///
+/// An unorderable compare is never resolved by guessing: if either side's
+/// `event_id` is `None` at an equal timestamp, the local row stands.
 pub fn retain_inbound_event(
     conn: &Connection,
     event: &RetainedEvent,
@@ -270,8 +347,10 @@ pub fn retain_inbound_event(
     let apply = match &existing {
         None => true,
         Some(row) if event.created_at > row.created_at => true,
-        // Equal or older: skip. Equal time may collide with a pending local
-        // edit, so we never clear its `pending_sync`; older is stale.
+        Some(row) if event.created_at == row.created_at => {
+            !row.pending_sync && inbound_wins_equal_timestamp(event, row)
+        }
+        // Older: stale.
         Some(_) => false,
     };
 
@@ -283,13 +362,14 @@ pub fn retain_inbound_event(
     // `pending_sync`. No upsert guard is needed — the Rust check above already
     // established that this event wins.
     conn.execute(
-        "INSERT INTO persona_events (kind, pubkey, d_tag, content, created_at, raw_event, pending_sync)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)
+        "INSERT INTO persona_events (kind, pubkey, d_tag, content, created_at, raw_event, pending_sync, event_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)
          ON CONFLICT (kind, pubkey, d_tag) DO UPDATE SET
             content = excluded.content,
             created_at = excluded.created_at,
             raw_event = excluded.raw_event,
-            pending_sync = 0",
+            pending_sync = 0,
+            event_id = excluded.event_id",
         params![
             event.kind,
             event.pubkey,
@@ -297,11 +377,33 @@ pub fn retain_inbound_event(
             event.content,
             event.created_at,
             event.raw_event,
+            event.event_id,
         ],
     )
     .map_err(|e| format!("failed to retain inbound event: {e}"))?;
 
     Ok(InboundOutcome::Applied)
+}
+
+/// Whether an inbound event beats a retained row they share a `created_at`
+/// with, under the relay's tie-break: strictly lower event id wins.
+///
+/// Mirrors `buzz-db`'s `replace_parameterized_event`, which rejects an incoming
+/// event when `created_at == accepted_ts && incoming_id >= accepted_id`. The
+/// comparison is over the id's raw bytes there and its lowercase hex here —
+/// same ordering, since hex encoding is monotonic over byte strings of equal
+/// length and NIP-01 ids are always 32 bytes.
+///
+/// A missing id on either side means the pair cannot be ordered the way the
+/// relay orders it. That returns `false`: the retained row stands, the inbound
+/// event is skipped, and nothing is decided from a fabricated key. The cost is
+/// a stale row until a strictly newer event arrives; the alternative is a local
+/// head the relay disagrees with.
+fn inbound_wins_equal_timestamp(inbound: &RetainedEvent, retained: &RetainedEvent) -> bool {
+    match (&inbound.event_id, &retained.event_id) {
+        (Some(inbound_id), Some(retained_id)) => inbound_id < retained_id,
+        _ => false,
+    }
 }
 
 /// Load all retained persona events for a given pubkey.
@@ -312,7 +414,7 @@ pub fn get_retained_personas(
 ) -> Result<Vec<RetainedEvent>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT kind, pubkey, d_tag, content, created_at, raw_event, pending_sync
+            "SELECT kind, pubkey, d_tag, content, created_at, raw_event, pending_sync, event_id
              FROM persona_events
              WHERE pubkey = ?1
              ORDER BY d_tag",
@@ -329,6 +431,7 @@ pub fn get_retained_personas(
                 created_at: row.get(4)?,
                 raw_event: row.get(5)?,
                 pending_sync: row.get::<_, i32>(6)? != 0,
+                event_id: row.get(7)?,
             })
         })
         .map_err(|e| format!("failed to query retained events: {e}"))?;
@@ -348,7 +451,7 @@ pub fn get_retained_personas(
 pub fn get_pending_sync(conn: &Connection) -> Result<Vec<RetainedEvent>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT kind, pubkey, d_tag, content, created_at, raw_event, pending_sync
+            "SELECT kind, pubkey, d_tag, content, created_at, raw_event, pending_sync, event_id
              FROM persona_events
              WHERE pending_sync = 1
              ORDER BY (kind != 5), created_at ASC",
@@ -365,6 +468,7 @@ pub fn get_pending_sync(conn: &Connection) -> Result<Vec<RetainedEvent>, String>
                 created_at: row.get(4)?,
                 raw_event: row.get(5)?,
                 pending_sync: row.get::<_, i32>(6)? != 0,
+                event_id: row.get(7)?,
             })
         })
         .map_err(|e| format!("failed to query pending sync events: {e}"))?;
@@ -440,7 +544,7 @@ pub fn get_retained_event(
     d_tag: &str,
 ) -> Result<Option<RetainedEvent>, String> {
     conn.query_row(
-        "SELECT kind, pubkey, d_tag, content, created_at, raw_event, pending_sync
+        "SELECT kind, pubkey, d_tag, content, created_at, raw_event, pending_sync, event_id
          FROM persona_events
          WHERE kind = ?1 AND pubkey = ?2 AND d_tag = ?3",
         params![kind, pubkey, d_tag],
@@ -453,6 +557,7 @@ pub fn get_retained_event(
                 created_at: row.get(4)?,
                 raw_event: row.get(5)?,
                 pending_sync: row.get::<_, i32>(6)? != 0,
+                event_id: row.get(7)?,
             })
         },
     )
@@ -461,474 +566,4 @@ pub fn get_retained_event(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn retention_scope_is_stable_and_separates_relay_and_owner() {
-        let base = Path::new("/tmp/buzz-retention-test");
-        let owner_a = "a".repeat(64);
-        let owner_b = "b".repeat(64);
-        let community_a = scoped_retention_db_path(base, "wss://a.example/", &owner_a);
-        assert_eq!(
-            community_a,
-            scoped_retention_db_path(base, "wss://a.example", &owner_a)
-        );
-        assert_ne!(
-            community_a,
-            scoped_retention_db_path(base, "wss://b.example", &owner_a)
-        );
-        assert_ne!(
-            community_a,
-            scoped_retention_db_path(base, "wss://a.example", &owner_b)
-        );
-    }
-
-    #[test]
-    fn test_arrival_relay_matching_agrees_with_database_identity() {
-        let base = Path::new("/tmp/buzz-retention-test");
-        let keys = nostr::Keys::generate();
-        let owner = keys.public_key().to_hex();
-        let scope = |relay: &str| RetentionScope {
-            db_path: scoped_retention_db_path(base, relay, &owner),
-            relay_url: relay.to_string(),
-            owner_keys: keys.clone(),
-        };
-        let community_a = scoped_retention_db_path(base, "wss://a.example", &owner);
-
-        // "Same relay" and "same database" must never disagree: every URL the
-        // match accepts has to hash to the scope's own db path, and every URL it
-        // rejects has to hash somewhere else.
-        for equivalent in ["wss://a.example", "wss://a.example/", " wss://a.example "] {
-            assert_eq!(
-                scope_for_arrival(scope("wss://a.example"), equivalent).map(|scope| scope.db_path),
-                Some(community_a.clone()),
-                "{equivalent}"
-            );
-            assert_eq!(
-                scoped_retention_db_path(base, equivalent, &owner),
-                community_a,
-                "{equivalent}"
-            );
-        }
-
-        assert!(
-            scope_for_arrival(scope("wss://b.example"), "wss://a.example").is_none(),
-            "an event from community A must not be filed while community B is active"
-        );
-        assert_ne!(
-            scoped_retention_db_path(base, "wss://b.example", &owner),
-            community_a
-        );
-    }
-
-    #[test]
-    fn concurrent_open_waits_for_initialization_lock() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("retention.db");
-        let first = open_retention_db(&path).unwrap();
-        first.execute_batch("BEGIN EXCLUSIVE").unwrap();
-
-        let second_path = path.clone();
-        let second = std::thread::spawn(move || open_retention_db(&second_path));
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        first.execute_batch("COMMIT").unwrap();
-
-        assert!(second.join().unwrap().is_ok());
-    }
-
-    fn test_db() -> Connection {
-        open_retention_db(Path::new(":memory:")).unwrap()
-    }
-
-    fn sample_event() -> RetainedEvent {
-        RetainedEvent {
-            kind: 30175,
-            pubkey: "abc123".to_string(),
-            d_tag: "test-persona".to_string(),
-            content: r#"{"display_name":"Test"}"#.to_string(),
-            created_at: 1000,
-            raw_event: r#"{"id":"..."}"#.to_string(),
-            pending_sync: true,
-        }
-    }
-
-    #[test]
-    fn retain_and_retrieve() {
-        let conn = test_db();
-        let event = sample_event();
-        retain_event(&conn, &event).unwrap();
-
-        let results = get_retained_personas(&conn, "abc123").unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].d_tag, "test-persona");
-        assert_eq!(results[0].created_at, 1000);
-        assert!(results[0].pending_sync);
-    }
-
-    #[test]
-    fn tombstone_retention_keys_are_distinct_across_kinds() {
-        // A persona slug, team id, and agent pubkey that all happen to equal
-        // "shared" must occupy DISTINCT kind:5 rows so one tombstone's pending
-        // publish never clobbers another's (F2c).
-        let conn = test_db();
-        for target_kind in [30175u32, 30176, 30177] {
-            retain_event(
-                &conn,
-                &RetainedEvent {
-                    kind: 5,
-                    pubkey: "owner".to_string(),
-                    d_tag: tombstone_retention_d_tag(target_kind, "shared"),
-                    content: String::new(),
-                    created_at: 1000,
-                    raw_event: format!("{{\"k\":{target_kind}}}"),
-                    pending_sync: true,
-                },
-            )
-            .unwrap();
-        }
-        // Three distinct rows survive — no PK collision clobbered any of them.
-        for target_kind in [30175u32, 30176, 30177] {
-            let row = get_retained_event(
-                &conn,
-                5,
-                "owner",
-                &tombstone_retention_d_tag(target_kind, "shared"),
-            )
-            .unwrap();
-            assert!(
-                row.is_some(),
-                "tombstone for kind {target_kind} was clobbered"
-            );
-        }
-    }
-
-    #[test]
-    fn upsert_replaces_newer() {
-        let conn = test_db();
-        let mut event = sample_event();
-        retain_event(&conn, &event).unwrap();
-
-        event.content = r#"{"display_name":"Updated"}"#.to_string();
-        event.created_at = 2000;
-        retain_event(&conn, &event).unwrap();
-
-        let results = get_retained_personas(&conn, "abc123").unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].created_at, 2000);
-        assert!(results[0].content.contains("Updated"));
-    }
-
-    #[test]
-    fn upsert_ignores_older() {
-        let conn = test_db();
-        let mut event = sample_event();
-        event.created_at = 2000;
-        retain_event(&conn, &event).unwrap();
-
-        event.content = r#"{"display_name":"Old"}"#.to_string();
-        event.created_at = 1000;
-        retain_event(&conn, &event).unwrap();
-
-        let results = get_retained_personas(&conn, "abc123").unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].created_at, 2000);
-        assert!(!results[0].content.contains("Old"));
-    }
-
-    #[test]
-    fn pending_sync_query() {
-        let conn = test_db();
-        let mut event = sample_event();
-        event.pending_sync = true;
-        retain_event(&conn, &event).unwrap();
-
-        let mut event2 = sample_event();
-        event2.d_tag = "other".to_string();
-        event2.pending_sync = false;
-        retain_event(&conn, &event2).unwrap();
-
-        let pending = get_pending_sync(&conn).unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].d_tag, "test-persona");
-    }
-
-    #[test]
-    fn test_mark_synced_matching_row_clears_flag() {
-        let conn = test_db();
-        let event = sample_event();
-        retain_event(&conn, &event).unwrap();
-
-        mark_synced(&conn, 30175, "abc123", "test-persona", 1000, &event.content).unwrap();
-
-        let pending = get_pending_sync(&conn).unwrap();
-        assert!(pending.is_empty());
-
-        let results = get_retained_personas(&conn, "abc123").unwrap();
-        assert_eq!(results.len(), 1);
-        assert!(!results[0].pending_sync);
-    }
-
-    #[test]
-    fn test_mark_synced_stale_version_leaves_flag_set() {
-        let conn = test_db();
-        let published = sample_event();
-        retain_event(&conn, &published).unwrap();
-
-        // A newer edit lands at the same coordinate before the flush loop
-        // clears the version it published.
-        let mut newer = sample_event();
-        newer.content = r#"{"display_name":"Edited"}"#.to_string();
-        newer.created_at = 2000;
-        retain_event(&conn, &newer).unwrap();
-
-        // Clearing against the OLD version must not touch the newer pending row.
-        mark_synced(
-            &conn,
-            30175,
-            "abc123",
-            "test-persona",
-            1000,
-            &published.content,
-        )
-        .unwrap();
-
-        let pending = get_pending_sync(&conn).unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].created_at, 2000);
-    }
-
-    #[test]
-    fn test_delete_retained_event_removes_row() {
-        let conn = test_db();
-        retain_event(&conn, &sample_event()).unwrap();
-
-        delete_retained_event(&conn, 30175, "abc123", "test-persona").unwrap();
-
-        assert!(get_retained_event(&conn, 30175, "abc123", "test-persona")
-            .unwrap()
-            .is_none());
-    }
-
-    #[test]
-    fn test_delete_retained_event_missing_row_is_noop() {
-        let conn = test_db();
-        delete_retained_event(&conn, 30175, "abc123", "nonexistent").unwrap();
-    }
-
-    #[test]
-    fn has_retained_personas_works() {
-        let conn = test_db();
-        assert!(!has_retained_personas(&conn, "abc123").unwrap());
-
-        let event = sample_event();
-        retain_event(&conn, &event).unwrap();
-
-        assert!(has_retained_personas(&conn, "abc123").unwrap());
-        assert!(!has_retained_personas(&conn, "other").unwrap());
-    }
-
-    #[test]
-    fn get_retained_event_by_coordinate() {
-        let conn = test_db();
-        let event = sample_event();
-        retain_event(&conn, &event).unwrap();
-
-        let found = get_retained_event(&conn, 30175, "abc123", "test-persona").unwrap();
-        assert!(found.is_some());
-        assert_eq!(found.unwrap().d_tag, "test-persona");
-
-        let not_found = get_retained_event(&conn, 30175, "abc123", "nonexistent").unwrap();
-        assert!(not_found.is_none());
-    }
-
-    #[test]
-    fn idempotent_retain_same_timestamp() {
-        let conn = test_db();
-        let event = sample_event();
-        retain_event(&conn, &event).unwrap();
-        retain_event(&conn, &event).unwrap();
-
-        let results = get_retained_personas(&conn, "abc123").unwrap();
-        assert_eq!(results.len(), 1);
-    }
-
-    #[test]
-    fn inbound_no_local_row_applies() {
-        let conn = test_db();
-        let mut event = sample_event();
-        event.pending_sync = false;
-
-        assert_eq!(
-            retain_inbound_event(&conn, &event).unwrap(),
-            InboundOutcome::Applied
-        );
-
-        let row = get_retained_event(&conn, 30175, "abc123", "test-persona")
-            .unwrap()
-            .unwrap();
-        assert_eq!(row.created_at, 1000);
-        assert!(!row.pending_sync);
-    }
-
-    #[test]
-    fn inbound_equal_second_skips_and_preserves_pending() {
-        let conn = test_db();
-        // Pending local edit at t=1000.
-        let local = sample_event();
-        retain_event(&conn, &local).unwrap();
-
-        // Inbound at the SAME second with different content.
-        let inbound = RetainedEvent {
-            content: r#"{"display_name":"Remote"}"#.to_string(),
-            pending_sync: false,
-            ..sample_event()
-        };
-        assert_eq!(
-            retain_inbound_event(&conn, &inbound).unwrap(),
-            InboundOutcome::Skipped
-        );
-
-        // Local pending row is untouched: flag preserved, content unchanged so
-        // the flush republishes and the relay resolves last-writer-wins.
-        let row = get_retained_event(&conn, 30175, "abc123", "test-persona")
-            .unwrap()
-            .unwrap();
-        assert!(row.pending_sync);
-        assert!(row.content.contains("Test"));
-    }
-
-    #[test]
-    fn inbound_strictly_newer_applies_and_clears_pending() {
-        let conn = test_db();
-        // Pending local edit at t=1000.
-        let local = sample_event();
-        retain_event(&conn, &local).unwrap();
-
-        // Inbound strictly newer with different content.
-        let inbound = RetainedEvent {
-            content: r#"{"display_name":"Remote"}"#.to_string(),
-            created_at: 2000,
-            pending_sync: false,
-            ..sample_event()
-        };
-        assert_eq!(
-            retain_inbound_event(&conn, &inbound).unwrap(),
-            InboundOutcome::Applied
-        );
-
-        // Inbound wins: content replaced and pending cleared, so the stale
-        // local edit stops republishing instead of looping.
-        let row = get_retained_event(&conn, 30175, "abc123", "test-persona")
-            .unwrap()
-            .unwrap();
-        assert_eq!(row.created_at, 2000);
-        assert!(!row.pending_sync);
-        assert!(row.content.contains("Remote"));
-    }
-
-    #[test]
-    fn inbound_older_skips() {
-        let conn = test_db();
-        let mut local = sample_event();
-        local.created_at = 2000;
-        retain_event(&conn, &local).unwrap();
-
-        let inbound = RetainedEvent {
-            content: r#"{"display_name":"Stale"}"#.to_string(),
-            created_at: 1000,
-            pending_sync: false,
-            ..sample_event()
-        };
-        assert_eq!(
-            retain_inbound_event(&conn, &inbound).unwrap(),
-            InboundOutcome::Skipped
-        );
-
-        let row = get_retained_event(&conn, 30175, "abc123", "test-persona")
-            .unwrap()
-            .unwrap();
-        assert_eq!(row.created_at, 2000);
-        assert!(!row.content.contains("Stale"));
-    }
-
-    #[test]
-    fn pending_sync_publishes_tombstones_before_replacements() {
-        // B5 resurrection race: a kind:5 retained in session N and the same
-        // coordinate's replacement 30175 retained on the next boot can sit
-        // pending together. The relay's a-tag deletion ignores timestamps,
-        // so the tombstone MUST publish first or it wipes the replacement.
-        let conn = test_db();
-        let replacement = RetainedEvent {
-            kind: 30175,
-            created_at: 2000,
-            pending_sync: true,
-            ..sample_event()
-        };
-        retain_event(&conn, &replacement).unwrap();
-        let tombstone = RetainedEvent {
-            kind: 5,
-            d_tag: tombstone_retention_d_tag(30175, "test-persona"),
-            content: String::new(),
-            created_at: 1000,
-            pending_sync: true,
-            ..sample_event()
-        };
-        retain_event(&conn, &tombstone).unwrap();
-
-        let pending = get_pending_sync(&conn).unwrap();
-        assert_eq!(pending.len(), 2);
-        assert_eq!(pending[0].kind, 5, "tombstone first");
-        assert_eq!(pending[1].kind, 30175, "replacement second");
-    }
-
-    #[test]
-    fn deferral_predicate_is_kind_and_pubkey_qualified() {
-        // Mid-sweep barrier semantics: a failed tombstone defers ONLY the
-        // replacement at its exact coordinate — same target kind, same pubkey.
-        use std::collections::HashSet;
-
-        let failed: HashSet<(String, String)> = HashSet::from([(
-            "abc123".to_string(),
-            tombstone_retention_d_tag(30175, "test-persona"),
-        )]);
-
-        // The covered replacement defers.
-        assert!(deferred_behind_failed_tombstone(
-            30175,
-            "abc123",
-            "test-persona",
-            &failed
-        ));
-        // Kind-qualified: a coinciding slug under a DIFFERENT kind is a
-        // distinct coordinate (the cross-kind collision the retention d-tag
-        // encoding exists to prevent) — never deferred.
-        assert!(!deferred_behind_failed_tombstone(
-            30177,
-            "abc123",
-            "test-persona",
-            &failed
-        ));
-        // Never crosses pubkeys.
-        assert!(!deferred_behind_failed_tombstone(
-            30175,
-            "other-key",
-            "test-persona",
-            &failed
-        ));
-        // Never defers kind:5 rows, even at a "matching" retention key.
-        assert!(!deferred_behind_failed_tombstone(
-            5,
-            "abc123",
-            "test-persona",
-            &failed
-        ));
-        // Unrelated d-tags publish normally.
-        assert!(!deferred_behind_failed_tombstone(
-            30175,
-            "abc123",
-            "other-persona",
-            &failed
-        ));
-    }
-}
+mod tests;

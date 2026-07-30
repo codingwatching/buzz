@@ -44,7 +44,6 @@ pub(super) fn retain_team_pending(app: &AppHandle, state: &AppState, team: &Team
         team_events::build_team_event,
     };
     use buzz_core_pkg::kind::KIND_TEAM;
-    use nostr::JsonUtil;
 
     let result = (|| -> Result<(), String> {
         let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
@@ -59,15 +58,7 @@ pub(super) fn retain_team_pending(app: &AppHandle, state: &AppState, team: &Team
             .map_err(|e| format!("failed to sign team event: {e}"))?;
         retain_event(
             &conn,
-            &RetainedEvent {
-                kind: KIND_TEAM,
-                pubkey,
-                d_tag: team.id.clone(),
-                content: event.content.to_string(),
-                created_at: event.created_at.as_secs() as i64,
-                raw_event: event.as_json(),
-                pending_sync: true,
-            },
+            &RetainedEvent::pending(KIND_TEAM, pubkey, team.id.clone(), &event),
         )
     })();
     if let Err(e) = result {
@@ -93,7 +84,6 @@ fn tombstone_team_pending(app: &AppHandle, state: &AppState, d_tag: &str) {
         team_events::build_team_delete,
     };
     use buzz_core_pkg::kind::KIND_TEAM;
-    use nostr::JsonUtil;
 
     const KIND_DELETE: u32 = 5;
 
@@ -107,17 +97,14 @@ fn tombstone_team_pending(app: &AppHandle, state: &AppState, d_tag: &str) {
         delete_retained_event(&conn, KIND_TEAM, &pubkey, d_tag)?;
         retain_event(
             &conn,
-            &RetainedEvent {
-                kind: KIND_DELETE,
+            &RetainedEvent::pending(
+                KIND_DELETE,
                 pubkey,
                 // Key by the target coordinate so cross-kind d-tag tombstones
                 // occupy distinct rows (F2c).
-                d_tag: tombstone_retention_d_tag(KIND_TEAM, d_tag),
-                content: event.content.to_string(),
-                created_at: event.created_at.as_secs() as i64,
-                raw_event: event.as_json(),
-                pending_sync: true,
-            },
+                tombstone_retention_d_tag(KIND_TEAM, d_tag),
+                &event,
+            ),
         )
     })();
     if let Err(e) = result {
