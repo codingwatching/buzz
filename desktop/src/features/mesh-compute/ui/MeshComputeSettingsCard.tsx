@@ -93,6 +93,7 @@ export function MeshComputeSettingsCard() {
   const [modelInput, setModelInput] = React.useState(() =>
     readDraft(MODEL_DRAFT_STORAGE_KEY),
   );
+  const hasInitializedRecommendedModel = React.useRef(false);
   const [maxVramGb, setMaxVramGb] = React.useState<string>(() =>
     readDraft(MAX_VRAM_DRAFT_STORAGE_KEY),
   );
@@ -149,14 +150,16 @@ export function MeshComputeSettingsCard() {
   // the simple Share switch remains a complete action while configuration
   // details stay tucked away until sharing is enabled.
   React.useEffect(() => {
+    if (!catalog || hasInitializedRecommendedModel.current) return;
+    hasInitializedRecommendedModel.current = true;
     if (modelInput.trim() !== "") return;
-    const recommended = catalog?.entries.find(
+    const recommended = catalog.entries.find(
       (entry) => entry.recommended && entry.fit !== "too_large",
     );
     if (!recommended) return;
     setModelInput(recommended.name);
     writeDraft(MODEL_DRAFT_STORAGE_KEY, recommended.name);
-  }, [catalog?.entries, modelInput]);
+  }, [catalog, modelInput]);
 
   // Mirror only a SERVE runtime's model into the field. A client reports the
   // remote model it is consuming; copying that value here both loses the
@@ -298,41 +301,57 @@ export function MeshComputeSettingsCard() {
           }}
         />
 
-        {isSharing ? (
-          <section
-            className="space-y-1"
-            data-testid="mesh-share-compute-sharing-status"
+        <div className="pt-3">
+          <button
+            aria-expanded={advancedOpen}
+            className="inline-flex h-9 items-center gap-1.5 text-sm font-medium text-foreground transition-colors hover:text-foreground/80 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+            data-testid="mesh-share-compute-advanced-toggle"
+            onClick={() => setAdvancedOpen((current) => !current)}
+            type="button"
           >
-            <h3 className="text-sm font-medium">Sharing</h3>
-            <div className="space-y-1 rounded-lg bg-muted/30 px-3 py-2">
-              <StatusLine
-                isConsuming={isConsuming}
-                omitSharingVerb
-                pendingAction={pendingAction}
-                status={status}
+            <span>Advanced</span>
+            <ChevronDown
+              className={cn(
+                "h-4 w-4 text-muted-foreground transition-transform duration-150 ease-out",
+                advancedOpen && "rotate-180",
+              )}
+            />
+          </button>
+          {advancedOpen ? (
+            <div className="mt-3 space-y-1.5">
+              <label className="text-sm font-medium" htmlFor="mesh-vram">
+                Max VRAM (GB)
+              </label>
+              <AgentConfigTextInput
+                data-testid="mesh-share-compute-vram"
+                disabled={controlsDisabled}
+                id="mesh-vram"
+                inputMode="decimal"
+                onChange={(e) => {
+                  const next = e.target.value;
+                  setMaxVramGb(next);
+                  writeDraft(MAX_VRAM_DRAFT_STORAGE_KEY, next);
+                }}
+                placeholder="No limit"
+                usePersonaInputStyle
+                value={maxVramGb}
               />
-              {servingIndicator.show ? (
-                <p
-                  className={
-                    servingIndicator.hasRemoteConsumers
-                      ? "text-2xs text-emerald-600 dark:text-emerald-400"
-                      : "text-2xs text-muted-foreground"
-                  }
-                  data-testid="mesh-serving-usage"
-                  title={servingIndicator.detail ?? undefined}
-                >
-                  {servingIndicator.label}
-                  {servingIndicator.detail ? (
-                    <span className="text-muted-foreground">
-                      {" "}
-                      · {servingIndicator.detail}
-                    </span>
-                  ) : null}
+              {status?.consoleUrl ? (
+                <p className="text-sm font-normal text-muted-foreground">
+                  Debug console:{" "}
+                  <a
+                    className="underline"
+                    href={status.consoleUrl}
+                    rel="noreferrer"
+                    target="_blank"
+                  >
+                    {status.consoleUrl}
+                  </a>
                 </p>
               ) : null}
             </div>
-          </section>
-        ) : null}
+          ) : null}
+        </div>
 
         <AnimatePresence initial={false}>
           {showSharingControls ? (
@@ -349,57 +368,39 @@ export function MeshComputeSettingsCard() {
                   : SHARE_COMPUTE_REVEAL_TRANSITION
               }
             >
-              <div className="pt-3">
-                <button
-                  aria-expanded={advancedOpen}
-                  className="inline-flex h-9 items-center gap-1.5 text-sm font-medium text-foreground transition-colors hover:text-foreground/80 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
-                  data-testid="mesh-share-compute-advanced-toggle"
-                  onClick={() => setAdvancedOpen((current) => !current)}
-                  type="button"
-                >
-                  <span>Advanced</span>
-                  <ChevronDown
-                    className={cn(
-                      "h-4 w-4 text-muted-foreground transition-transform duration-150 ease-out",
-                      advancedOpen && "rotate-180",
-                    )}
+              <section
+                className="space-y-1"
+                data-testid="mesh-share-compute-sharing-status"
+              >
+                <h3 className="text-sm font-medium">Sharing</h3>
+                <div className="space-y-1 rounded-lg bg-muted/30 px-3 py-2">
+                  <StatusLine
+                    isConsuming={isConsuming}
+                    omitSharingVerb
+                    pendingAction={pendingAction}
+                    status={status}
                   />
-                </button>
-                {advancedOpen ? (
-                  <div className="mt-3 space-y-1.5">
-                    <label className="text-sm font-medium" htmlFor="mesh-vram">
-                      Max VRAM (GB)
-                    </label>
-                    <AgentConfigTextInput
-                      data-testid="mesh-share-compute-vram"
-                      disabled={controlsDisabled}
-                      id="mesh-vram"
-                      inputMode="decimal"
-                      onChange={(e) => {
-                        const next = e.target.value;
-                        setMaxVramGb(next);
-                        writeDraft(MAX_VRAM_DRAFT_STORAGE_KEY, next);
-                      }}
-                      placeholder="No limit"
-                      usePersonaInputStyle
-                      value={maxVramGb}
-                    />
-                    {status?.consoleUrl ? (
-                      <p className="text-sm font-normal text-muted-foreground">
-                        Debug console:{" "}
-                        <a
-                          className="underline"
-                          href={status.consoleUrl}
-                          rel="noreferrer"
-                          target="_blank"
-                        >
-                          {status.consoleUrl}
-                        </a>
-                      </p>
-                    ) : null}
-                  </div>
-                ) : null}
-              </div>
+                  {servingIndicator.show ? (
+                    <p
+                      className={
+                        servingIndicator.hasRemoteConsumers
+                          ? "text-2xs text-emerald-600 dark:text-emerald-400"
+                          : "text-2xs text-muted-foreground"
+                      }
+                      data-testid="mesh-serving-usage"
+                      title={servingIndicator.detail ?? undefined}
+                    >
+                      {servingIndicator.label}
+                      {servingIndicator.detail ? (
+                        <span className="text-muted-foreground">
+                          {" "}
+                          · {servingIndicator.detail}
+                        </span>
+                      ) : null}
+                    </p>
+                  ) : null}
+                </div>
+              </section>
             </motion.div>
           ) : null}
         </AnimatePresence>
